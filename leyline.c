@@ -172,11 +172,11 @@ void queue_push_notify(int fd, GAsyncQueue *q, gpointer data) {
     }
 }
 
-static ssize_t packet_bio_write(z_streamp strm, BIO *bio, struct packet_s *p) {
+static ssize_t packet_bio_write(z_streamp strm, BIO *bio, struct packet_s *p, int try_compress) {
     char buf[PACKET_DATA_SIZE*2];
     ssize_t nw = 0;
     //g_debug("bio write: %zu", p->hdr.size);
-    if (p->hdr.size) {
+    if (p->hdr.size && try_compress) {
         strm->next_in = (Bytef *)p->buf;
         strm->avail_in = p->hdr.size;
         strm->next_out = (Bytef *)buf;
@@ -515,6 +515,9 @@ static void *tunnel_handler(void *arg) {
     pds[1].fd = s->write_fd;
     pds[1].events = POLLIN;
 
+    uint64_t packet_count = 0;
+    uint64_t compressed_packet_count = 0;
+    int compression = 1;
     for (;;) {
         pds[0].revents = 0;
         pds[1].revents = 0;
@@ -550,7 +553,22 @@ static void *tunnel_handler(void *arg) {
                 //    p->hdr.size);
 
                 //ssize_t nw = packet_write(&zso, client_nfd, p);
-                ssize_t nw = packet_bio_write(&zso, bio, p);
+                if (compression && packet_count >= 10) {
+                    if ((compression / (float)packet_count) <= 0.5) {
+                        // turn off compression
+                        g_debug("turning off compression");
+                        compression = 0;
+                    }
+                }
+                ++packet_count;
+                ssize_t nw = packet_bio_write(&zso, bio, p, compression);
+                /* TODO: the compression testing should really happen on a per client basis.
+                 * this is just for testing the performance gains
+                 */
+                if (p->hdr.flags & TUN_FLAG_COMPRESSED) {
+                    ++compressed_packet_count;
+                }
+
                 g_slice_free(struct packet_s, p);
                 if (nw <= 0) goto done;
             }
@@ -699,6 +717,10 @@ static void *tunnel_thread(void *arg) {
         g_message("SSL handshake with tunnel done");
     }
 
+    uint64_t packet_count = 0;
+    uint64_t compressed_packet_count = 0;
+    int compression = 1;
+
     struct pollfd pds[2];
     pds[0].fd = sock;
     pds[0].events = POLLIN;
@@ -736,7 +758,18 @@ static void *tunnel_thread(void *arg) {
                 //    p->hdr.size);
 
                 //ssize_t nw = packet_write(&zso, rmt_nfd, p);
-                ssize_t nw = packet_bio_write(&zso, bio, p);
+                if (compression && packet_count >= 10) {
+                    if ((compression / (float)packet_count) <= 0.5) {
+                        // turn off compression
+                        g_debug("turning off compression");
+                        compression = 0;
+                    }
+                }
+                ++packet_count;
+                ssize_t nw = packet_bio_write(&zso, bio, p, compression);
+                if (p->hdr.flags & TUN_FLAG_COMPRESSED) {
+                    ++compressed_packet_count;
+                }
                 g_slice_free(struct packet_s, p);
                 if (nw <= 0) goto done;
             }
