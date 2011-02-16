@@ -234,7 +234,7 @@ static ssize_t packet_bio_read(z_streamp strm, BIO *bio, struct packet_s *p) {
         int status = inflate(strm, Z_FINISH);
         //g_debug("status: %d msg: %s", status, strm->msg);
         g_assert(status == Z_STREAM_END);
-        g_debug("< inflate %lu/%zu", strm->total_out, p->hdr.size);
+        g_debug("< inflate %lu/%u", strm->total_out, p->hdr.size);
         p->hdr.flags &= TUN_FLAG_COMPRESSED;
         p->hdr.size = strm->total_out;
         memcpy(p->buf, buf, p->hdr.size);
@@ -255,7 +255,7 @@ static ssize_t packet_write(z_streamp strm, st_netfd_t nfd, struct packet_s *p) 
         int status = deflate(strm, Z_FINISH);
         g_assert(status == Z_STREAM_END);
         if (strm->total_out < p->hdr.size) {
-            g_debug("< deflate total out: %lu/%zu", strm->total_out, p->hdr.size);
+            g_debug("< deflate total out: %lu/%u", strm->total_out, p->hdr.size);
             p->hdr.flags |= TUN_FLAG_COMPRESSED;
             p->hdr.size = strm->total_out;
             struct iovec iov[2];
@@ -288,7 +288,7 @@ static ssize_t packet_read(z_streamp strm, st_netfd_t nfd, struct packet_s *p) {
         int status = inflate(strm, Z_FINISH);
         //g_debug("status: %d msg: %s", status, strm->msg);
         g_assert(status == Z_STREAM_END);
-        g_debug("< inflate %lu/%zu", strm->total_out, p->hdr.size);
+        g_debug("< inflate %lu/%u", strm->total_out, p->hdr.size);
         p->hdr.flags &= TUN_FLAG_COMPRESSED;
         p->hdr.size = strm->total_out;
         memcpy(p->buf, buf, p->hdr.size);
@@ -573,7 +573,6 @@ static void *handle_connection(void *arg) {
     address_t local_addr;
     socklen_t slen;
     int status;
-    gpointer hkey;
     addr_t laddr;
 
     slen = sizeof(listening_addr);
@@ -588,8 +587,8 @@ static void *handle_connection(void *arg) {
     server_t *s = g_hash_table_lookup(netmap, &laddr);
     g_assert(s);
 
-    hkey = (gpointer)ADDRESS_PORT(local_addr);
-    g_hash_table_insert(s->connections, hkey, client_nfd);
+    uintptr_t hkey = ADDRESS_PORT(local_addr);
+    g_hash_table_insert(s->connections, (gpointer)hkey, client_nfd);
 
     char addrbuf[INET6_ADDRSTRLEN];
     g_message("new peer: %s:%u",
@@ -608,7 +607,7 @@ static void *handle_connection(void *arg) {
         ssize_t nr = st_read(client_nfd, p->buf, sizeof(p->buf), ST_UTIME_NO_TIMEOUT);
         if (nr <= 0) { g_slice_free(struct packet_s, p); break; }
         /* TODO: maybe don't do think  translation every time through the loop. could just be a memcpy */
-        if (!g_hash_table_lookup(s->connections, hkey)) {
+        if (!g_hash_table_lookup(s->connections, (gpointer)hkey)) {
             /* connection missing from hash, probably got close packet from tunnel */
             g_slice_free(struct packet_s, p);
             break;
@@ -619,7 +618,7 @@ static void *handle_connection(void *arg) {
         queue_push_notify(s->write_fd, s->write_queue, p);
     }
     g_message("closing peer");
-    if (g_hash_table_remove(s->connections, hkey)) {
+    if (g_hash_table_remove(s->connections, (gpointer)hkey)) {
         /* push empty packet to notify remote end of close */
         struct packet_s *p = g_slice_new0(struct packet_s);
         address_to_addr(&local_addr, &p->hdr.laddr);
