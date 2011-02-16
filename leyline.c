@@ -166,6 +166,9 @@ void queue_push_notify(int fd, GAsyncQueue *q, gpointer data) {
             perror("queue push notify write failed?!?!?!");
             abort();
         }
+    } else if (len >= 10) {
+        //g_debug("queue backlog: %u sleeping to throttle.", len);
+        st_usleep(len * 10);
     }
 }
 
@@ -815,7 +818,7 @@ static void *write_in_sthread(void *arg) {
         /* TODO: this seems to be breaking, causing the queue size to grow large */
 
         if (pds[0].revents & POLLIN) {
-            //g_debug("read queue notified");
+            //g_debug("read queue notified %p", (void *)s);
             char tmp[1];
             read(s->write_fd, tmp, 1);
             struct packet_s *p;
@@ -841,6 +844,7 @@ static void *write_in_sthread(void *arg) {
                 }
                 g_slice_free(struct packet_s, p);
             }
+            //g_debug("read queue emptied");
         }
     }
     return NULL;
