@@ -420,7 +420,7 @@ static void *tunnel_out_thread(void *arg) {
 
                         ssize_t nw = st_write(rmt_nfd, p->buf, p->hdr.size, ST_UTIME_NO_TIMEOUT);
                         g_debug("%zd bytes written to tunnel out client", nw);
-                        st_thread_t t = st_thread_create(tunnel_out_read_sthread, to, 0, 4*1024);
+                        st_thread_t t = st_thread_create(tunnel_out_read_sthread, to, 0, 8*1024);
                         g_assert(t);
                     } else {
                         g_message("connection to remote host failed. notify client through tunnel.");
@@ -800,7 +800,7 @@ static st_thread_t listen_server(server_t *s, void *(*start)(void *arg)) {
 
     s->nfd = st_netfd_open_socket(sock);
     s->start = start;
-    return st_thread_create(accept_loop, (void *)s, 0, 4 * 1024);
+    return st_thread_create(accept_loop, (void *)s, 0, 8 * 1024);
 }
 
 static void *write_in_sthread(void *arg) {
@@ -1014,7 +1014,7 @@ int main(int argc, char *argv[]) {
         s->write_queue = g_async_queue_new_full(packet_free);
         s->connections = g_hash_table_new(g_direct_hash, g_direct_equal);
         s->listen_sthread = listen_server(s, handle_connection);
-        s->write_sthread = st_thread_create(write_in_sthread, s, 0, 4*1024);
+        s->write_sthread = st_thread_create(write_in_sthread, s, 0, 8*1024);
         g_thread_create(tunnel_thread, s, TRUE, NULL);
     }
 
