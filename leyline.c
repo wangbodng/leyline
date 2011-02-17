@@ -554,9 +554,9 @@ static void *tunnel_handler(void *arg) {
 
                 //ssize_t nw = packet_write(&zso, client_nfd, p);
                 if (compression && packet_count >= 10) {
-                    if ((compression / (float)packet_count) <= 0.5) {
+                    if ((compressed_packet_count / (float)packet_count) < 0.5) {
                         // turn off compression
-                        g_debug("turning off compression");
+                        g_debug("turning off compression: %lu/%lu", compressed_packet_count, packet_count);
                         compression = 0;
                     }
                 }
@@ -565,7 +565,7 @@ static void *tunnel_handler(void *arg) {
                 /* TODO: the compression testing should really happen on a per client basis.
                  * this is just for testing the performance gains
                  */
-                if (p->hdr.flags & TUN_FLAG_COMPRESSED) {
+                if (p->hdr.flags & TUN_FLAG_COMPRESSED || p->hdr.size == 0) {
                     ++compressed_packet_count;
                 }
 
@@ -759,15 +759,16 @@ static void *tunnel_thread(void *arg) {
 
                 //ssize_t nw = packet_write(&zso, rmt_nfd, p);
                 if (compression && packet_count >= 10) {
-                    if ((compression / (float)packet_count) <= 0.5) {
+                    if ((compressed_packet_count / (float)packet_count) <= 0.5) {
                         // turn off compression
-                        g_debug("turning off compression");
+                        g_debug("turning off compression: %lu/%lu", compressed_packet_count, packet_count);
                         compression = 0;
                     }
                 }
                 ++packet_count;
                 ssize_t nw = packet_bio_write(&zso, bio, p, compression);
-                if (p->hdr.flags & TUN_FLAG_COMPRESSED) {
+                /* count 0 size packets as compressed just for the purposes of the % compressed calculation */
+                if (p->hdr.flags & TUN_FLAG_COMPRESSED || p->hdr.size == 0) {
                     ++compressed_packet_count;
                 }
                 g_slice_free(struct packet_s, p);
