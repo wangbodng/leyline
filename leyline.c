@@ -556,7 +556,10 @@ static void *tunnel_handler(void *arg) {
                 if (compression && packet_count >= 10) {
                     if ((compressed_packet_count / (float)packet_count) < 0.5) {
                         // turn off compression
-                        g_debug("turning off compression: %lu/%lu", compressed_packet_count, packet_count);
+                        g_debug("turning off compression: %lu/%lu %f",
+                            compressed_packet_count,
+                            packet_count,
+                            (compressed_packet_count / (float)packet_count));
                         compression = 0;
                     }
                 }
@@ -759,9 +762,12 @@ static void *tunnel_thread(void *arg) {
 
                 //ssize_t nw = packet_write(&zso, rmt_nfd, p);
                 if (compression && packet_count >= 10) {
-                    if ((compressed_packet_count / (float)packet_count) <= 0.5) {
+                    if ((compressed_packet_count / (float)packet_count) < 0.5) {
                         // turn off compression
-                        g_debug("turning off compression: %lu/%lu", compressed_packet_count, packet_count);
+                        g_debug("turning off compression: %lu/%lu %f",
+                            compressed_packet_count,
+                            packet_count,
+                            (compressed_packet_count / (float)packet_count));
                         compression = 0;
                     }
                 }
