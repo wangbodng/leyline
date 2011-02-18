@@ -11,6 +11,8 @@
 #include <openssl/err.h>
 #include "st_ssl.h"
 #include <zlib.h>
+#include <sys/signalfd.h>
+#include <signal.h>
 
 union address_u {
     struct sockaddr sa;
@@ -112,7 +114,6 @@ static void packet_free(gpointer data) {
     g_slice_free(struct packet_s, data);
 }
 
-/* TODO: replace server_s */
 struct server_s {
     st_netfd_t nfd;
     void *(*start)(void *arg);
@@ -228,60 +229,6 @@ static ssize_t packet_bio_read(z_streamp strm, BIO *bio, struct packet_s *p) {
         nr = 0;
     }
     //g_debug("bio read hdr size: %zd", nr);
-    if (p->hdr.flags & TUN_FLAG_COMPRESSED) {
-        char buf[PACKET_DATA_SIZE];
-        strm->next_in = (Bytef *)p->buf;
-        strm->avail_in = p->hdr.size;
-        strm->next_out = (Bytef *)buf;
-        strm->avail_out = sizeof(buf);
-        int status = inflate(strm, Z_FINISH);
-        //g_debug("status: %d msg: %s", status, strm->msg);
-        g_assert(status == Z_STREAM_END);
-        g_debug("< inflate %lu/%u", strm->total_out, p->hdr.size);
-        p->hdr.flags &= TUN_FLAG_COMPRESSED;
-        p->hdr.size = strm->total_out;
-        memcpy(p->buf, buf, p->hdr.size);
-        inflateReset(strm);
-        return p->hdr.size;
-    }
-    return nr;
-}
-
-static ssize_t packet_write(z_streamp strm, st_netfd_t nfd, struct packet_s *p) {
-    char buf[PACKET_DATA_SIZE*2];
-    ssize_t nw = 0;
-    if (p->hdr.size) {
-        strm->next_in = (Bytef *)p->buf;
-        strm->avail_in = p->hdr.size;
-        strm->next_out = (Bytef *)buf;
-        strm->avail_out = sizeof(buf);
-        int status = deflate(strm, Z_FINISH);
-        g_assert(status == Z_STREAM_END);
-        if (strm->total_out < p->hdr.size) {
-            g_debug("< deflate total out: %lu/%u", strm->total_out, p->hdr.size);
-            p->hdr.flags |= TUN_FLAG_COMPRESSED;
-            p->hdr.size = strm->total_out;
-            struct iovec iov[2];
-            iov[0].iov_base = &p->hdr;
-            iov[0].iov_len = PACKET_HEADER_SIZE;
-            iov[1].iov_base = buf;
-            iov[1].iov_len = strm->total_out;
-            nw = st_writev(nfd, iov, 2, ST_UTIME_NO_TIMEOUT);
-        } else {
-            nw = st_write(nfd, p, PACKET_HEADER_SIZE+p->hdr.size, ST_UTIME_NO_TIMEOUT);
-        }
-        deflateReset(strm);
-    } else {
-        nw = st_write(nfd, p, PACKET_HEADER_SIZE+p->hdr.size, ST_UTIME_NO_TIMEOUT);
-    }
-    return nw;
-}
-
-static ssize_t packet_read(z_streamp strm, st_netfd_t nfd, struct packet_s *p) {
-    ssize_t nr = st_read_fully(nfd, p, PACKET_HEADER_SIZE, ST_UTIME_NO_TIMEOUT);
-    if (nr <= 0) return -1;
-    nr = st_read_fully(nfd, p->buf, p->hdr.size, ST_UTIME_NO_TIMEOUT);
-    if (nr != p->hdr.size) return -1;
     if (p->hdr.flags & TUN_FLAG_COMPRESSED) {
         char buf[PACKET_DATA_SIZE];
         strm->next_in = (Bytef *)p->buf;
@@ -446,8 +393,6 @@ done:
     g_warn_if_reached();
     return NULL;
 }
-
-
 
 static void *tunnel_handler(void *arg) {
     st_netfd_t client_nfd = (st_netfd_t)arg;
@@ -928,16 +873,14 @@ static void parse_config(const gchar *conffile) {
         goto free_key_file;
     }
 
-    gchar *start_group = g_key_file_get_start_group(kf);
-    g_debug("start group: %s", start_group);
-
     /* tunnel listening address */
     gchar *tun_listen_address_str = g_key_file_get_value(kf, "tunnel", "listen_address", NULL);
-    g_assert(tun_listen_address_str);
-    if (strtoaddr(tun_listen_address_str, &tunnel_server->listen_addr) != 1) {
-        g_error("invalid address: %s", tun_listen_address_str);
+    if (tun_listen_address_str) {
+        if (strtoaddr(tun_listen_address_str, &tunnel_server->listen_addr) != 1) {
+            g_error("invalid address: %s", tun_listen_address_str);
+        }
+        g_free(tun_listen_address_str);
     }
-    g_free(tun_listen_address_str);
 
     /* tunnel cert */
     tunnel_cert_path = g_key_file_get_value(kf, "tunnel", "cert_file", NULL);
@@ -989,10 +932,7 @@ free_address_strings:
             if (tunnel_address_str) g_free(tunnel_address_str);
         }
     }
-    g_free(start_group);
-free_groups:
     g_strfreev(groups);
-
 free_key_file:
     g_key_file_free(kf);
 }
@@ -1005,16 +945,34 @@ static GOptionEntry entires[] = {
     {NULL, 0, 0, 0, 0 , NULL, NULL}
 };
 
+#define handle_error(msg) \
+    do { perror(msg); exit(EXIT_FAILURE); } while (0)
+
 int main(int argc, char *argv[]) {
+    sigset_t mask;
+    int sfd;
+    struct signalfd_siginfo fdsi;
+
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGQUIT);
+
+    /* Block signals so that they aren't handled                                                                                                                                                                                
+       according to their default dispositions */
+    if (sigprocmask(SIG_BLOCK, &mask, NULL) == -1) { handle_error("sigprocmask"); }
+    /* i don't use SFD_NONBLOCK here because st_netfd_open will set O_NONBLOCK */
+    sfd = signalfd(-1, &mask, 0);
+    if (sfd == -1) { handle_error("signalfd"); }
+
+    /* init glib threads */
     g_thread_init(NULL);
 
+    /* init Open SSL */
     SSL_load_error_strings();
     SSL_library_init();
 
-    if (st_init() < 0) {
-        perror("st_init");
-        exit(1);
-    }
+    /* init state threads */
+    if (st_init() < 0) { handle_error("state threads"); }
 
 #if 0
     g_debug("sizeof(addr_t) = %zu", sizeof(addr_t));
@@ -1024,9 +982,6 @@ int main(int argc, char *argv[]) {
     g_debug("sizeof(struct sockaddr_storage) = %zu", sizeof(struct sockaddr_storage));
     g_debug("sizeof(address_t) = %zu", sizeof(address_t));
 #endif
-
-    int sockets[2];
-    int status;
 
     netmap = g_hash_table_new(g_int_hash, addr_match);
     tunmap = g_hash_table_new(g_int_hash, addr_match);
@@ -1045,8 +1000,9 @@ int main(int argc, char *argv[]) {
 
     parse_config(conffile);
 
-    /* TODO: should require a mode and either be a tunnel listener or connector */
-    tunnel_server->listen_sthread = listen_server(tunnel_server, tunnel_handler);
+    if (tunnel_server->listen_addr.port) {
+        tunnel_server->listen_sthread = listen_server(tunnel_server, tunnel_handler);
+    }
 
     /* start port listeners */
     GHashTableIter iter;
@@ -1054,6 +1010,8 @@ int main(int argc, char *argv[]) {
     server_t *s;
     g_hash_table_iter_init(&iter, netmap);
     while (g_hash_table_iter_next(&iter, (gpointer *)&listen_addr, (gpointer *)&s)) {
+        int sockets[2];
+        int status;
         status = socketpair(AF_UNIX, SOCK_STREAM, 0, sockets);
         g_assert(status ==  0);
         s->write_fd = sockets[0];
@@ -1066,8 +1024,25 @@ int main(int argc, char *argv[]) {
         g_thread_create(tunnel_thread, s, TRUE, NULL);
     }
 
-    st_thread_join(tunnel_server->listen_sthread, NULL);
+    st_netfd_t sig_nfd = st_netfd_open(sfd);
+    if (sig_nfd == NULL) { handle_error("st_netfd_open sig fd"); }
 
+    ssize_t nr = st_read_fully(sig_nfd, &fdsi, sizeof(fdsi), ST_UTIME_NO_TIMEOUT);
+    if (nr != sizeof(fdsi)) { handle_error("read sig struct"); }
+
+    switch (fdsi.ssi_signo) {
+        case SIGINT:
+            g_debug("got SIGINT\n");
+            break;
+        case SIGQUIT:
+            g_debug("got SIGQUIT\n");
+            break;
+        default:
+            g_debug("unexpected signal: %d\n", fdsi.ssi_signo);
+            break;
+    }
+    /* don't bother cleaning anything up, just exit this mofo */
+    exit(EXIT_SUCCESS);
     st_thread_exit(NULL);
     g_warn_if_reached();
     return EXIT_FAILURE;
