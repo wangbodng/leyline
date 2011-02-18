@@ -664,6 +664,7 @@ static void *tunnel_thread(void *arg) {
     z_stream zso;
     z_stream zsi;
 
+    /* TODO: this is tricky because packets might not have made it across, but been removed from queue */
 restart:
     memset(&zso, 0, sizeof(zso));
     status = deflateInit2(&zso, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 9, Z_DEFAULT_STRATEGY);
