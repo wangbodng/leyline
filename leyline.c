@@ -14,6 +14,9 @@
 #include <sys/signalfd.h>
 #include <signal.h>
 
+#define handle_error(msg) \
+    do { perror(msg); exit(EXIT_FAILURE); } while (0)
+
 union address_u {
     struct sockaddr sa;
     struct sockaddr_in sa_in;
@@ -164,8 +167,7 @@ void queue_push_notify(int fd, GAsyncQueue *q, gpointer data) {
     if (len == 0) {
         int n = write(fd, (void*)"\x01", 1);
         if (n != 1) {
-            perror("queue push notify write failed?!?!?!");
-            abort();
+            handle_error("queue_push_notify write failed");
         }
     } else if (len >= 10) {
         //g_debug("queue backlog: %u sleeping to throttle.", len);
@@ -767,12 +769,12 @@ static st_thread_t listen_server(server_t *s, void *(*start)(void *arg)) {
     int n;
 
     if ((sock = socket(PF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("socket");
+        handle_error("socket");
     }
 
     n = 1;
     if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&n, sizeof(n)) < 0) {
-        perror("setsockopt SO_REUSEADDR");
+        handle_error("setsockopt SO_REUSEADDR");
     }
 
     address_t serv_addr;
@@ -783,11 +785,11 @@ static st_thread_t listen_server(server_t *s, void *(*start)(void *arg)) {
         ntohs(ADDRESS_PORT(serv_addr)));
 
     if (bind(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        perror("bind");
+        handle_error("bind");
     }
 
     if (listen(sock, 10) < 0) {
-        perror("listen");
+        handle_error("listen");
     }
 
     s->nfd = st_netfd_open_socket(sock);
@@ -944,9 +946,6 @@ static GOptionEntry entires[] = {
     {"config", 'c', 0, G_OPTION_ARG_FILENAME, &conffile, "config file path", NULL},
     {NULL, 0, 0, 0, 0 , NULL, NULL}
 };
-
-#define handle_error(msg) \
-    do { perror(msg); exit(EXIT_FAILURE); } while (0)
 
 int main(int argc, char *argv[]) {
     sigset_t mask;
