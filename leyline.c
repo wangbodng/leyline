@@ -661,14 +661,15 @@ static void *tunnel_thread(void *arg) {
     int status;
     server_t *s = (server_t *)arg;
     st_init();
-
     z_stream zso;
+    z_stream zsi;
+
+restart:
     memset(&zso, 0, sizeof(zso));
     status = deflateInit2(&zso, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 9, Z_DEFAULT_STRATEGY);
     g_assert(status == Z_OK);
     g_debug("default bound: %lu", deflateBound(&zso, PACKET_DATA_SIZE));
 
-    z_stream zsi;
     memset(&zsi, 0, sizeof(zsi));
     status = inflateInit2(&zsi, -15);
     g_assert(status == Z_OK);
@@ -788,6 +789,8 @@ done:
     BIO_free_all(bio);
     deflateEnd(&zso);
     inflateEnd(&zsi);
+    /* try to reconnect to tunnel again */
+    goto restart;
     st_thread_exit(NULL);
     g_warn_if_reached();
     return NULL;
