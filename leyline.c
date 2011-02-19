@@ -95,7 +95,7 @@ static gboolean addr_match(gconstpointer a_, gconstpointer b_) {
 enum packet_flag_e {
     TUN_FLAG_CLOSE = 1,
     TUN_FLAG_COMPRESSED = 2,
-    TUN_FLAG_CLOSE_ALL = 3, /* when tunnel connection dies */
+    TUN_FLAG_CLOSE_ALL = 4, /* when tunnel connection dies */
 };
 
 struct packet_header_s {
@@ -828,8 +828,8 @@ static st_thread_t listen_server(server_t *s, void *(*start)(void *arg)) {
 }
 
 static gboolean close_connection(gpointer k, gpointer v, gpointer user_data) {
-    st_netfd_t nfd = (st_netfd_t)v;
-    st_netfd_close(nfd);
+    client_t *c = (client_t *)v;
+    st_thread_interrupt(c->sthread);
     return TRUE;
 }
 
