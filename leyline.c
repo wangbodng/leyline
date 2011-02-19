@@ -511,7 +511,7 @@ static void *tunnel_handler(void *arg) {
                 struct packet_s *p = g_slice_new(struct packet_s);
                 //ssize_t nr = packet_read(&zsi, client_nfd, p);
                 ssize_t nr = packet_bio_read(&zsi, bio, p);
-                if (nr < 0) { g_slice_free(struct packet_s, p); break; }
+                if (nr < 0) { g_slice_free(struct packet_s, p); goto done; }
                 //g_debug("tunnel slave read %zd out of %d", nr, p->hdr.size);
                 //g_debug("bio pending: %zd", BIO_ctrl_pending(bio));
                 queue_push_notify(s->write_fd, s->write_queue, p);
