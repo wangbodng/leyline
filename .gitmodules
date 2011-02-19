@@ -1,0 +1,3 @@
+[submodule "extern/state-threads"]
+	path = extern/state-threads
+	url = git://github.com/toffaletti/state-threads.git
