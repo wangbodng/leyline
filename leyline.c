@@ -136,6 +136,7 @@ struct server_s {
 
     st_thread_t listen_sthread;
     st_thread_t write_sthread;
+    GThread *thread; /* tunnel_thread or tunnel_out_thread */
 };
 typedef struct server_s server_t;
 
@@ -261,6 +262,21 @@ static ssize_t packet_bio_read(z_streamp strm, BIO *bio, struct packet_s *p) {
     return nr;
 }
 
+static gboolean close_connection(gpointer k, gpointer v, gpointer user_data) {
+    (void)k;
+    (void)user_data;
+    client_t *c = (client_t *)v;
+    /* this will interrupt tunnel_out_read_sthread *or* handle_connection,
+     * which will free the client_t and do other cleanup. it is important
+     * that the cleanup happens in the thread where the st_netfd_t is in use
+     * see st_netfd_close for a description of why.
+     */
+    st_thread_interrupt(c->sthread);
+    return TRUE;
+}
+
+/* TUNNEL SOCKET SERVER */
+
 static void *tunnel_out_read_sthread(void *arg) {
     client_t *c = (client_t *)arg;
     server_t *s = c->s;
@@ -345,6 +361,10 @@ static void *tunnel_out_thread(void *arg) {
                 //    ADDR_STRING(p->hdr.laddr, laddrbuf, sizeof(laddrbuf)), ntohs(p->hdr.laddr.port),
                 //    ADDR_STRING(p->hdr.raddr, raddrbuf, sizeof(raddrbuf)), ntohs(p->hdr.raddr.port),
                 //    p->hdr.size);
+                if (p->hdr.flags & TUN_FLAG_CLOSE_ALL) {
+                    g_slice_free(struct packet_s, p);
+                    goto done;
+                }
                 client_t *c = g_hash_table_lookup(s->connections, &p->hdr.laddr);
                 if ((p->hdr.flags & TUN_FLAG_CLOSE) && c && c->nfd) {
                     /* TODO maybe use st_thread_interrupt here? */
@@ -363,10 +383,12 @@ static void *tunnel_out_thread(void *arg) {
                     addr_to_address(&p->hdr.raddr, &rmt_addr);
                     /* Connect to remote host */
                     if ((sock = socket(rmt_addr.sa.sa_family, SOCK_STREAM, 0)) < 0) {
+                        g_slice_free(struct packet_s, p);
                         goto done;
                     }
                     if ((rmt_nfd = st_netfd_open_socket(sock)) == NULL) {
                         close(sock);
+                        g_slice_free(struct packet_s, p);
                         goto done;
                     }
                     if (st_connect(rmt_nfd, (struct sockaddr *)&rmt_addr,
@@ -374,17 +396,16 @@ static void *tunnel_out_thread(void *arg) {
                         g_message("connected to remote host!");
 
                         client_t *c = g_slice_new0(client_t);
-                        c->sthread = st_thread_self();
                         c->nfd = rmt_nfd;
                         c->s = s;
                         c->laddr = p->hdr.laddr;
 
                         g_hash_table_insert(s->connections, &c->laddr, c);
 
-                        ssize_t nw = st_write(rmt_nfd, p->buf, p->hdr.size, ST_UTIME_NO_TIMEOUT);
-                        g_debug("%zd bytes written to tunnel out client", nw);
-                        st_thread_t t = st_thread_create(tunnel_out_read_sthread, c, 0, 8*1024);
-                        g_assert(t);
+                        /* the packet that initiates an outgoing connection should have 0 bytes */
+                        g_assert(p->hdr.size == 0);
+                        c->sthread = st_thread_create(tunnel_out_read_sthread, c, 0, 8*1024);
+                        g_assert(c->sthread);
                     } else {
                         g_message("connection to remote host failed. notify client through tunnel.");
                         struct packet_s *rp = g_slice_new0(struct packet_s);
@@ -402,6 +423,7 @@ static void *tunnel_out_thread(void *arg) {
     }
 done:
     g_message("exiting tunnel out thread!!");
+    g_hash_table_foreach_remove(s->connections, close_connection, NULL);
     st_thread_exit(NULL);
     g_warn_if_reached();
     return NULL;
@@ -460,12 +482,12 @@ static void *tunnel_handler(void *arg) {
 
     slen = sizeof(local_addr);
     status = getpeername(st_netfd_fileno(client_nfd), &local_addr.sa, &slen);
-    g_assert(status == 0);
+    if (status != 0) { goto done; }
 
     s = server_new();
     /* use remote_addr to store the peer address since it is unused */
     address_to_addr(&local_addr, &s->remote_addr);
-    g_thread_create(tunnel_out_thread, s, TRUE, NULL);
+    s->thread = g_thread_create(tunnel_out_thread, s, TRUE, NULL);
     g_hash_table_insert(tunmap, &s->remote_addr, s);
 
     pds[0].fd = st_netfd_fileno(client_nfd);
@@ -482,6 +504,8 @@ static void *tunnel_handler(void *arg) {
         if (st_poll(pds, 2, ST_UTIME_NO_TIMEOUT) <= 0) break;
 
         if (pds[0].revents & POLLIN) {
+            /* read packets off the tunnel and add then to the
+             * write queue to be sent to connections we initiated */
             do {
                 //g_debug("tunnel server read");
                 struct packet_s *p = g_slice_new(struct packet_s);
@@ -514,7 +538,7 @@ static void *tunnel_handler(void *arg) {
                 if (compression && packet_count >= 10) {
                     if ((compressed_packet_count / (float)packet_count) < 0.5) {
                         // turn off compression
-                        g_debug("turning off compression: %lu/%lu %f",
+                        g_debug("turning off compression: %llu/%llu %f",
                             compressed_packet_count,
                             packet_count,
                             (compressed_packet_count / (float)packet_count));
@@ -537,17 +561,51 @@ static void *tunnel_handler(void *arg) {
     }
 done:
     g_message("exiting tunnel handler!!");
+
     if (ctx) SSL_CTX_free(ctx);
     BIO_free_all(bio);
     deflateEnd(&zso);
     inflateEnd(&zsi);
     if (s) {
         g_hash_table_remove(tunmap, &s->remote_addr);
+
+        /* shutdown all sockets and flush queues */
+        struct packet_s *p = g_slice_new0(struct packet_s);
+        p->hdr.flags |= TUN_FLAG_CLOSE_ALL;
+        queue_push_notify(s->write_fd, s->write_queue, p);
+        /* empty the read queue */
+        do {
+            struct packet_s *p;
+            while ((p = g_async_queue_try_pop(s->read_queue))) {
+                g_slice_free(struct packet_s, p);
+            }
+        } while (0);
+
+        g_debug("tunnel_out_thread joining...");
+        g_thread_join(s->thread);
+        g_debug("tunnel_out_thread done");
+
+        /* empty the write queue */
+        do {
+            struct packet_s *p;
+            while ((p = g_async_queue_try_pop(s->write_queue))) {
+                g_slice_free(struct packet_s, p);
+            }
+        } while (0);
+        g_async_queue_unref(s->read_queue);
+        g_async_queue_unref(s->write_queue);
+        close(s->read_fd);
+        close(s->write_fd);
+        g_assert(g_hash_table_size(s->connections) == 0);
+        g_hash_table_unref(s->connections);
+
         g_slice_free(server_t, s);
     }
     st_netfd_close(client_nfd);
     return NULL;
 }
+
+/* PORT LISTENING SIDE */
 
 static void *handle_connection(void *arg) {
     st_netfd_t client_nfd = (st_netfd_t)arg;
@@ -730,7 +788,7 @@ restart:
                 if (compression && packet_count >= 10) {
                     if ((compressed_packet_count / (float)packet_count) < 0.5) {
                         // turn off compression
-                        g_debug("turning off compression: %lu/%lu %f",
+                        g_debug("turning off compression: %llu/%llu %f",
                             compressed_packet_count,
                             packet_count,
                             (compressed_packet_count / (float)packet_count));
@@ -827,12 +885,6 @@ static st_thread_t listen_server(server_t *s, void *(*start)(void *arg)) {
     return st_thread_create(accept_loop, (void *)s, 0, 8 * 1024);
 }
 
-static gboolean close_connection(gpointer k, gpointer v, gpointer user_data) {
-    client_t *c = (client_t *)v;
-    st_thread_interrupt(c->sthread);
-    return TRUE;
-}
-
 static void *write_in_sthread(void *arg) {
     /* write data coming across the tunnel to the client which initiated the connection */
     server_t *s = (server_t *)arg;
@@ -842,7 +894,6 @@ static void *write_in_sthread(void *arg) {
     for (;;) {
         pds[0].revents = 0;
         if (st_poll(pds, 1, ST_UTIME_NO_TIMEOUT) <= 0) break;
-        /* TODO: this seems to be breaking, causing the queue size to grow large */
 
         if (pds[0].revents & POLLIN) {
             //g_debug("read queue notified %p", (void *)s);
@@ -857,6 +908,7 @@ static void *write_in_sthread(void *arg) {
                 //    ADDR_STRING(p->hdr.raddr, raddrbuf, sizeof(raddrbuf)), ntohs(p->hdr.raddr.port),
                 //    p->hdr.size);
                 if (p->hdr.flags & TUN_FLAG_CLOSE_ALL) {
+                    g_debug("removing all connections");
                     g_hash_table_foreach_remove(s->connections, close_connection, NULL);
                     continue;
                 }
@@ -879,6 +931,7 @@ static void *write_in_sthread(void *arg) {
             //g_debug("read queue emptied");
         }
     }
+    g_debug("exiting write_in_sthread");
     return NULL;
 }
 
@@ -1065,7 +1118,7 @@ int main(int argc, char *argv[]) {
         s->connections = g_hash_table_new(g_direct_hash, g_direct_equal);
         s->listen_sthread = listen_server(s, handle_connection);
         s->write_sthread = st_thread_create(write_in_sthread, s, 0, 8*1024);
-        g_thread_create(tunnel_thread, s, TRUE, NULL);
+        s->thread = g_thread_create(tunnel_thread, s, TRUE, NULL);
     }
 
     st_netfd_t sig_nfd = st_netfd_open(sfd);
