@@ -13,6 +13,7 @@
 #include <zlib.h>
 #include <sys/signalfd.h>
 #include <signal.h>
+#include <sys/time.h>
 
 #define handle_error(msg) \
     do { perror(msg); exit(EXIT_FAILURE); } while (0)
@@ -94,6 +95,7 @@ static gboolean addr_match(gconstpointer a_, gconstpointer b_) {
 enum packet_flag_e {
     TUN_FLAG_CLOSE = 1,
     TUN_FLAG_COMPRESSED = 2,
+    TUN_FLAG_CLOSE_ALL = 3, /* when tunnel connection dies */
 };
 
 struct packet_header_s {
@@ -151,6 +153,15 @@ server_t *server_new(void) {
     s->connections = g_hash_table_new(g_int_hash, addr_match);
     return s;
 }
+
+/* used to store client connection data */
+struct client_s {
+    st_thread_t sthread;
+    st_netfd_t nfd;
+    server_t *s;
+    addr_t laddr;
+};
+typedef struct client_s client_t;
 
 /* globals */
 static GHashTable *netmap;
@@ -250,21 +261,16 @@ static ssize_t packet_bio_read(z_streamp strm, BIO *bio, struct packet_s *p) {
     return nr;
 }
 
-/* pass state info to tunnel_out_read_sthread */
-struct tun_out_s {
-    server_t *s;
-    addr_t laddr;
-};
-
 static void *tunnel_out_read_sthread(void *arg) {
-    struct tun_out_s *to = (struct tun_out_s *)arg;
-    server_t *s = to->s;
-    addr_t *laddr = &to->laddr;
+    client_t *c = (client_t *)arg;
+    server_t *s = c->s;
+    addr_t *laddr = &c->laddr;
     address_t remote_addr;
     socklen_t slen;
     int status;
 
-    st_netfd_t client_nfd = g_hash_table_lookup(s->connections, laddr);
+    st_netfd_t client_nfd = c->nfd;
+    //st_netfd_t client_nfd = g_hash_table_lookup(s->connections, laddr);
     g_assert(client_nfd);
 
     slen = sizeof(remote_addr);
@@ -311,7 +317,7 @@ static void *tunnel_out_read_sthread(void *arg) {
         queue_push_notify(s->read_fd, s->read_queue, p);
     }
 
-    g_slice_free(struct tun_out_s, to);
+    g_slice_free(client_t, c);
     st_netfd_close(client_nfd);
     return NULL;
 }
@@ -339,13 +345,14 @@ static void *tunnel_out_thread(void *arg) {
                 //    ADDR_STRING(p->hdr.laddr, laddrbuf, sizeof(laddrbuf)), ntohs(p->hdr.laddr.port),
                 //    ADDR_STRING(p->hdr.raddr, raddrbuf, sizeof(raddrbuf)), ntohs(p->hdr.raddr.port),
                 //    p->hdr.size);
-                st_netfd_t client_nfd = g_hash_table_lookup(s->connections, &p->hdr.laddr);
-                if ((p->hdr.flags & TUN_FLAG_CLOSE) && client_nfd) {
+                client_t *c = g_hash_table_lookup(s->connections, &p->hdr.laddr);
+                if ((p->hdr.flags & TUN_FLAG_CLOSE) && c && c->nfd) {
+                    /* TODO maybe use st_thread_interrupt here? */
                     g_message("got close flag packet. removing tunnel out client: %p (%d)",
-                        (void*)client_nfd, st_netfd_fileno(client_nfd));
+                        (void*)c->nfd, st_netfd_fileno(c->nfd));
                     g_hash_table_remove(s->connections, &p->hdr.laddr);
-                } else if (client_nfd) {
-                    ssize_t nw = st_write(client_nfd, p->buf, p->hdr.size, ST_UTIME_NO_TIMEOUT);
+                } else if (c && c->nfd) {
+                    ssize_t nw = st_write(c->nfd, p->buf, p->hdr.size, ST_UTIME_NO_TIMEOUT);
                     if (nw <= 0) { g_warning("write failed"); }
                 } else if (!(p->hdr.flags & TUN_FLAG_CLOSE)) {
                     g_message("tunnel out client not found, creating one");
@@ -365,14 +372,18 @@ static void *tunnel_out_thread(void *arg) {
                     if (st_connect(rmt_nfd, (struct sockaddr *)&rmt_addr,
                           sizeof(rmt_addr), ST_UTIME_NO_TIMEOUT) == 0) {
                         g_message("connected to remote host!");
-                        struct tun_out_s *to = g_slice_new0(struct tun_out_s);
-                        to->s = s;
-                        memcpy(&to->laddr, &p->hdr.laddr, sizeof(addr_t));
-                        g_hash_table_insert(s->connections, &to->laddr, rmt_nfd);
+
+                        client_t *c = g_slice_new0(client_t);
+                        c->sthread = st_thread_self();
+                        c->nfd = rmt_nfd;
+                        c->s = s;
+                        c->laddr = p->hdr.laddr;
+
+                        g_hash_table_insert(s->connections, &c->laddr, c);
 
                         ssize_t nw = st_write(rmt_nfd, p->buf, p->hdr.size, ST_UTIME_NO_TIMEOUT);
                         g_debug("%zd bytes written to tunnel out client", nw);
-                        st_thread_t t = st_thread_create(tunnel_out_read_sthread, to, 0, 8*1024);
+                        st_thread_t t = st_thread_create(tunnel_out_read_sthread, c, 0, 8*1024);
                         g_assert(t);
                     } else {
                         g_message("connection to remote host failed. notify client through tunnel.");
@@ -558,8 +569,14 @@ static void *handle_connection(void *arg) {
     server_t *s = g_hash_table_lookup(netmap, &laddr);
     g_assert(s);
 
+    client_t *c = g_slice_new0(client_t);
+    c->sthread = st_thread_self();
+    c->nfd = client_nfd;
+    c->s = s;
+    c->laddr = laddr;
+
     uintptr_t hkey = ADDRESS_PORT(local_addr);
-    g_hash_table_insert(s->connections, (gpointer)hkey, client_nfd);
+    g_hash_table_insert(s->connections, (gpointer)hkey, c);
 
     char addrbuf[INET6_ADDRSTRLEN];
     g_message("new peer: %s:%u",
@@ -635,8 +652,7 @@ restart:
 
     /* Connect to remote host */
     if ((sock = socket(rmt_addr.sa.sa_family, SOCK_STREAM, 0)) < 0) {
-        close(sock);
-        goto done;
+        handle_error("socket");
     }
 
     st_netfd_t rmt_nfd;
@@ -649,8 +665,9 @@ restart:
               sizeof(rmt_addr), ST_UTIME_NO_TIMEOUT) == 0) {
             break;
         }
-        g_message("sleeping before reconnecting tunnel");
-        st_sleep(1);
+        int sleep_sec = (random() % 5) + 1;
+        g_message("sleeping %u sec before retry connecting tunnel", sleep_sec);
+        st_sleep(sleep_sec);
     }
     g_message("connected to tunnel!");
 
@@ -663,7 +680,7 @@ restart:
         if (BIO_do_handshake(bio_ssl) <= 0) {
             g_warning("Error establishing SSL connection");
             ERR_print_errors_fp(stderr);
-            goto done;
+            abort();
         }
 
         g_message("SSL handshake with tunnel done");
@@ -688,7 +705,7 @@ restart:
                 struct packet_s *p = g_slice_new(struct packet_s);
                 //ssize_t nr = packet_read(&zsi, rmt_nfd, p);
                 ssize_t nr = packet_bio_read(&zsi, bio, p);
-                if (nr < 0) { g_slice_free(struct packet_s, p); break; }
+                if (nr < 0) { g_slice_free(struct packet_s, p); goto done; }
                 queue_push_notify(s->read_fd, s->read_queue, p);
             /* BIO ssl seems to buffer data, so the loop with 
              * BIO_ctrl_pending will help avoid
@@ -732,11 +749,24 @@ restart:
         }
     }
 done:
-    g_message("exiting tunnel thread!!");
+    g_message("restarting tunnel thread!!");
     if (ctx) SSL_CTX_free(ctx);
     BIO_free_all(bio);
     deflateEnd(&zso);
     inflateEnd(&zsi);
+
+    /* shutdown all sockets and flush queues */
+    struct packet_s *p = g_slice_new0(struct packet_s);
+    p->hdr.flags |= TUN_FLAG_CLOSE_ALL;
+    queue_push_notify(s->read_fd, s->read_queue, p);
+    /* empty the write queue */
+    do {
+        struct packet_s *p;
+        while ((p = g_async_queue_try_pop(s->write_queue))) {
+            g_slice_free(struct packet_s, p);
+        }
+    } while (0);
+
     /* try to reconnect to tunnel again */
     goto restart;
     st_thread_exit(NULL);
@@ -797,6 +827,12 @@ static st_thread_t listen_server(server_t *s, void *(*start)(void *arg)) {
     return st_thread_create(accept_loop, (void *)s, 0, 8 * 1024);
 }
 
+static gboolean close_connection(gpointer k, gpointer v, gpointer user_data) {
+    st_netfd_t nfd = (st_netfd_t)v;
+    st_netfd_close(nfd);
+    return TRUE;
+}
+
 static void *write_in_sthread(void *arg) {
     /* write data coming across the tunnel to the client which initiated the connection */
     server_t *s = (server_t *)arg;
@@ -820,14 +856,19 @@ static void *write_in_sthread(void *arg) {
                 //    ADDR_STRING(p->hdr.laddr, laddrbuf, sizeof(laddrbuf)), ntohs(p->hdr.laddr.port),
                 //    ADDR_STRING(p->hdr.raddr, raddrbuf, sizeof(raddrbuf)), ntohs(p->hdr.raddr.port),
                 //    p->hdr.size);
+                if (p->hdr.flags & TUN_FLAG_CLOSE_ALL) {
+                    g_hash_table_foreach_remove(s->connections, close_connection, NULL);
+                    continue;
+                }
                 uintptr_t port = p->hdr.laddr.port;
-                st_netfd_t client_nfd = g_hash_table_lookup(s->connections, (gpointer)port);
-                if (p->hdr.flags & TUN_FLAG_CLOSE && client_nfd) {
+                client_t *c = g_hash_table_lookup(s->connections, (gpointer)port);
+                if (p->hdr.flags & TUN_FLAG_CLOSE && c && c->nfd) {
+                    /* TODO: might be able to use st_thread_interrupt here */
                     g_message("found peer client, disconnecting");
                     g_hash_table_remove(s->connections, (gpointer)port);
-                } else if (client_nfd) {
+                } else if (c && c->nfd) {
                     //g_debug("found peer client!");
-                    ssize_t nw = st_write(client_nfd, p->buf, p->hdr.size, ST_UTIME_NO_TIMEOUT);
+                    ssize_t nw = st_write(c->nfd, p->buf, p->hdr.size, ST_UTIME_NO_TIMEOUT);
                     //g_debug("%zd bytes written to client", nw);
                     if (nw <= 0) { g_warning("write failed"); }
                 } else {
@@ -951,6 +992,10 @@ int main(int argc, char *argv[]) {
     sigset_t mask;
     int sfd;
     struct signalfd_siginfo fdsi;
+    struct timeval tv;
+
+    gettimeofday(&tv, NULL);
+    srandom(tv.tv_usec);
 
     sigemptyset(&mask);
     sigaddset(&mask, SIGINT);
