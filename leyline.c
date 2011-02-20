@@ -182,7 +182,7 @@ void queue_push_notify(int fd, GAsyncQueue *q, gpointer data) {
             handle_error("queue_push_notify write failed");
         }
     } else if (len >= 10) {
-        //g_debug("queue backlog: %u sleeping to throttle.", len);
+        /* g_debug("queue backlog: %u sleeping to throttle.", len); */
         st_usleep(len * 10);
     }
 }
@@ -190,7 +190,6 @@ void queue_push_notify(int fd, GAsyncQueue *q, gpointer data) {
 static ssize_t packet_bio_write(z_streamp strm, BIO *bio, struct packet_s *p, int try_compress) {
     char buf[PACKET_DATA_SIZE*2];
     ssize_t nw = 0;
-    //g_debug("bio write: %zu", p->hdr.size);
     if (p->hdr.size && try_compress) {
         strm->next_in = (Bytef *)p->buf;
         strm->avail_in = p->hdr.size;
@@ -232,17 +231,15 @@ static ssize_t bio_read_fully(BIO *bio, void *buf, size_t size) {
 }
 
 static ssize_t packet_bio_read(z_streamp strm, BIO *bio, struct packet_s *p) {
-    //g_debug("bio read");
     ssize_t nr = bio_read_fully(bio, p, PACKET_HEADER_SIZE);
     if (nr <= 0) return -1;
     if (p->hdr.size) {
         nr = bio_read_fully(bio, p->buf, p->hdr.size);
         if (nr != p->hdr.size) return -1;
     } else {
-        // 0 bytes read because packet payload was empty
+        /* 0 bytes read because packet payload was empty */
         nr = 0;
     }
-    //g_debug("bio read hdr size: %zd", nr);
     if (p->hdr.flags & TUN_FLAG_COMPRESSED) {
         char buf[PACKET_DATA_SIZE];
         strm->next_in = (Bytef *)p->buf;
@@ -250,7 +247,6 @@ static ssize_t packet_bio_read(z_streamp strm, BIO *bio, struct packet_s *p) {
         strm->next_out = (Bytef *)buf;
         strm->avail_out = sizeof(buf);
         int status = inflate(strm, Z_FINISH);
-        //g_debug("status: %d msg: %s", status, strm->msg);
         g_assert(status == Z_STREAM_END);
         g_debug("< inflate %lu/%u", strm->total_out, p->hdr.size);
         p->hdr.flags &= TUN_FLAG_COMPRESSED;
@@ -366,7 +362,6 @@ static void *tunnel_out_read_sthread(void *arg) {
     int status;
 
     st_netfd_t client_nfd = c->nfd;
-    //st_netfd_t client_nfd = g_hash_table_lookup(s->connections, laddr);
     g_assert(client_nfd);
 
     slen = sizeof(remote_addr);
@@ -434,13 +429,7 @@ static void *tunnel_out_thread(void *arg) {
             int n = read(s->read_fd, tmp, 1);
             g_assert(n == 1);
             struct packet_s *p;
-            //char laddrbuf[INET6_ADDRSTRLEN];
-            //char raddrbuf[INET6_ADDRSTRLEN];
             while ((p = g_async_queue_try_pop(s->write_queue))) {
-                //g_debug("packet out write queue local: %s:%u remote: %s:%u size: %u",
-                //    ADDR_STRING(p->hdr.laddr, laddrbuf, sizeof(laddrbuf)), ntohs(p->hdr.laddr.port),
-                //    ADDR_STRING(p->hdr.raddr, raddrbuf, sizeof(raddrbuf)), ntohs(p->hdr.raddr.port),
-                //    p->hdr.size);
                 if (p->hdr.flags & TUN_FLAG_CLOSE_ALL) {
                     g_slice_free(struct packet_s, p);
                     goto done;
@@ -527,7 +516,7 @@ static void *tunnel_handler(void *arg) {
     if (tunnel_cert_path && tunnel_pkey_path) {
         ctx = SSL_CTX_new(SSLv23_server_method());
 
-        // http://h71000.www7.hp.com/doc/83final/ba554_90007/ch04s03.html
+        /* http://h71000.www7.hp.com/doc/83final/ba554_90007/ch04s03.html */
         if (!SSL_CTX_use_certificate_file(ctx, tunnel_cert_path, SSL_FILETYPE_PEM)) {
             g_warning("error loading cert file");
             ERR_print_errors_fp(stderr);
@@ -589,12 +578,9 @@ static void *tunnel_handler(void *arg) {
             /* read packets off the tunnel and add then to the
              * write queue to be sent to connections we initiated */
             do {
-                //g_debug("tunnel server read");
                 struct packet_s *p = g_slice_new(struct packet_s);
                 ssize_t nr = packet_bio_read(&zsi, bio, p);
                 if (nr < 0) { g_slice_free(struct packet_s, p); goto done; }
-                //g_debug("tunnel slave read %zd out of %d", nr, p->hdr.size);
-                //g_debug("bio pending: %zd", BIO_ctrl_pending(bio));
                 queue_push_notify(s->write_fd, s->write_queue, p);
                 /* BIO ssl seems to buffer data, so the loop with 
                  * BIO_ctrl_pending will help avoid
@@ -607,14 +593,7 @@ static void *tunnel_handler(void *arg) {
             char tmp[1];
             read(s->write_fd, tmp, 1);
             struct packet_s *p;
-            //char laddrbuf[INET6_ADDRSTRLEN];
-            //char raddrbuf[INET6_ADDRSTRLEN];
             while ((p = g_async_queue_try_pop(s->read_queue))) {
-                //g_debug("tunnel packet local: %s:%u remote: %s:%u size: %u",
-                //    ADDR_STRING(p->hdr.laddr, laddrbuf, sizeof(laddrbuf)), ntohs(p->hdr.laddr.port),
-                //    ADDR_STRING(p->hdr.raddr, raddrbuf, sizeof(raddrbuf)), ntohs(p->hdr.raddr.port),
-                //    p->hdr.size);
-
                 if (compression && packet_count >= 10) {
                     if ((compressed_packet_count / (float)packet_count) < 0.5) {
                         // turn off compression
@@ -628,7 +607,6 @@ static void *tunnel_handler(void *arg) {
                 ++packet_count;
                 ssize_t nw = packet_bio_write(&zso, bio, p, compression);
                 /* TODO: the compression testing should really happen on a per client basis.
-                 * this is just for testing the performance gains
                  */
                 if (p->hdr.flags & TUN_FLAG_COMPRESSED || p->hdr.size == 0) {
                     ++compressed_packet_count;
@@ -766,7 +744,6 @@ static void *server_tunnel_thread(void *arg) {
     z_stream zso;
     z_stream zsi;
 
-    /* TODO: this is tricky because packets might not have made it across, but been removed from queue */
 restart:
     memset(&zso, 0, sizeof(zso));
     status = deflateInit2(&zso, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 9, Z_DEFAULT_STRATEGY);
@@ -840,7 +817,6 @@ restart:
         if (pds[0].revents & POLLIN) {
             do {
                 struct packet_s *p = g_slice_new(struct packet_s);
-                //ssize_t nr = packet_read(&zsi, rmt_nfd, p);
                 ssize_t nr = packet_bio_read(&zsi, bio, p);
                 if (nr < 0) { g_slice_free(struct packet_s, p); goto done; }
                 queue_push_notify(s->read_fd, s->read_queue, p);
@@ -853,16 +829,10 @@ restart:
 
         if (pds[1].revents & POLLIN) {
             char tmp[1];
-            read(s->read_fd, tmp, 1);
+            int n = read(s->read_fd, tmp, 1);
+            g_assert(n == 1);
             struct packet_s *p;
             while ((p = g_async_queue_try_pop(s->write_queue))) {
-                //char laddrbuf[INET6_ADDRSTRLEN];
-                //char raddrbuf[INET6_ADDRSTRLEN];
-                //g_debug("packet local: %s:%u remote: %s:%u size: %u",
-                //    ADDR_STRING(p->hdr.laddr, laddrbuf, sizeof(laddrbuf)), ntohs(p->hdr.laddr.port),
-                //    ADDR_STRING(p->hdr.raddr, raddrbuf, sizeof(raddrbuf)), ntohs(p->hdr.raddr.port),
-                //    p->hdr.size);
-
                 if (compression && packet_count >= 10) {
                     if ((compressed_packet_count / (float)packet_count) < 0.5) {
                         // turn off compression
@@ -921,17 +891,10 @@ static void *server_write_sthread(void *arg) {
         if (st_poll(pds, 1, ST_UTIME_NO_TIMEOUT) <= 0) break;
 
         if (pds[0].revents & POLLIN) {
-            //g_debug("read queue notified %p", (void *)s);
             char tmp[1];
             read(s->write_fd, tmp, 1);
             struct packet_s *p;
-            //char laddrbuf[INET6_ADDRSTRLEN];
-            //char raddrbuf[INET6_ADDRSTRLEN];
             while ((p = g_async_queue_try_pop(s->read_queue))) {
-                //g_debug("packet read queue local: %s:%u remote: %s:%u size: %u",
-                //    ADDR_STRING(p->hdr.laddr, laddrbuf, sizeof(laddrbuf)), ntohs(p->hdr.laddr.port),
-                //    ADDR_STRING(p->hdr.raddr, raddrbuf, sizeof(raddrbuf)), ntohs(p->hdr.raddr.port),
-                //    p->hdr.size);
                 if (p->hdr.flags & TUN_FLAG_CLOSE_ALL) {
                     g_debug("removing all connections");
                     g_hash_table_foreach_remove(s->connections, close_connection, NULL);
@@ -951,7 +914,6 @@ static void *server_write_sthread(void *arg) {
                 }
                 g_slice_free(struct packet_s, p);
             }
-            //g_debug("read queue emptied");
         }
     }
     g_debug("exiting server_write_sthread");
