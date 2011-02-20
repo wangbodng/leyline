@@ -206,7 +206,7 @@ static void queue_remove_all_packets(GAsyncQueue *q) {
 }
 
 static ssize_t packet_bio_write(z_streamp strm, BIO *bio, struct packet_s *p, int try_compress) {
-    char buf[PACKET_DATA_SIZE*2];
+    char *buf = alloca(deflateBound(strm, PACKET_DATA_SIZE));
     ssize_t nw = 0;
     if (p->hdr.size && try_compress) {
         strm->next_in = (Bytef *)p->buf;
@@ -560,7 +560,6 @@ static void *tunnel_handler(void *arg) {
     memset(&zso, 0, sizeof(zso));
     status = deflateInit2(&zso, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 9, Z_DEFAULT_STRATEGY);
     g_assert(status == Z_OK);
-    g_debug("default bound: %lu", deflateBound(&zso, PACKET_DATA_SIZE));
 
     z_stream zsi;
     memset(&zsi, 0, sizeof(zsi));
@@ -752,7 +751,6 @@ restart:
     memset(&zso, 0, sizeof(zso));
     status = deflateInit2(&zso, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 9, Z_DEFAULT_STRATEGY);
     g_assert(status == Z_OK);
-    g_debug("default bound: %lu", deflateBound(&zso, PACKET_DATA_SIZE));
 
     memset(&zsi, 0, sizeof(zsi));
     status = inflateInit2(&zsi, -15);
