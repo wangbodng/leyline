@@ -140,19 +140,17 @@ struct server_s {
 };
 typedef struct server_s server_t;
 
-server_t *server_new(void) {
+void server_init(server_t *s, GHashTable *ctable) {
     int sockets[2];
     int status;
 
-    server_t *s = g_slice_new0(server_t);
     status = socketpair(AF_UNIX, SOCK_STREAM, 0, sockets);
     g_assert(status ==  0);
     s->write_fd = sockets[0];
     s->read_fd = sockets[1];
     s->read_queue = g_async_queue_new_full(packet_free);
     s->write_queue = g_async_queue_new_full(packet_free);
-    s->connections = g_hash_table_new(g_int_hash, addr_match);
-    return s;
+    s->connections = ctable;
 }
 
 /* used to store client connection data */
@@ -573,7 +571,8 @@ static void *tunnel_handler(void *arg) {
     status = getpeername(st_netfd_fileno(client_nfd), &local_addr.sa, &slen);
     if (status != 0) { goto done; }
 
-    s = server_new();
+    s = g_slice_new0(server_t);
+    server_init(s, g_hash_table_new(g_int_hash, addr_match));
     /* use remote_addr to store the peer address since it is unused */
     address_to_addr(&local_addr, &s->remote_addr);
     s->thread = g_thread_create(tunnel_out_thread, s, TRUE, NULL);
@@ -1064,15 +1063,7 @@ int main(int argc, char *argv[]) {
     server_t *s;
     g_hash_table_iter_init(&iter, netmap);
     while (g_hash_table_iter_next(&iter, (gpointer *)&listen_addr, (gpointer *)&s)) {
-        int sockets[2];
-        int status;
-        status = socketpair(AF_UNIX, SOCK_STREAM, 0, sockets);
-        g_assert(status ==  0);
-        s->write_fd = sockets[0];
-        s->read_fd = sockets[1];
-        s->read_queue = g_async_queue_new_full(packet_free);
-        s->write_queue = g_async_queue_new_full(packet_free);
-        s->connections = g_hash_table_new(g_direct_hash, g_direct_equal);
+        server_init(s, g_hash_table_new(g_direct_hash, g_direct_equal));
         s->listen_sthread = listen_server(s, server_handle_connection);
         s->write_sthread = st_thread_create(server_write_sthread, s, 0, 8*1024);
         s->thread = g_thread_create(server_tunnel_thread, s, TRUE, NULL);
