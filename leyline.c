@@ -262,6 +262,86 @@ static ssize_t packet_bio_read(z_streamp strm, BIO *bio, struct packet_s *p) {
     return nr;
 }
 
+static void *accept_loop(void *arg) {
+    struct server_s *s = (struct server_s *)arg;
+    st_netfd_t client_nfd;
+    struct sockaddr_in from;
+    int fromlen = sizeof(from);
+
+    for (;;) {
+        client_nfd = st_accept(s->nfd,
+          (struct sockaddr *)&from, &fromlen, ST_UTIME_NO_TIMEOUT);
+        g_message("accepted new connection");
+        if (st_thread_create(s->start,
+          (void *)client_nfd, 0, 1024 * 1024) == NULL)
+        {
+            g_critical("st_thread_create error");
+        }
+    }
+    g_warn_if_reached();
+    return NULL;
+}
+
+static st_thread_t listen_server(server_t *s, void *(*start)(void *arg)) {
+    int sock;
+    int n;
+
+    if ((sock = socket(PF_INET, SOCK_STREAM, 0)) < 0) {
+        handle_error("socket");
+    }
+
+    n = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&n, sizeof(n)) < 0) {
+        handle_error("setsockopt SO_REUSEADDR");
+    }
+
+    address_t serv_addr;
+    addr_to_address(&s->listen_addr, &serv_addr);
+    char addrbuf[INET6_ADDRSTRLEN];
+    g_message("binding listening socket to: %s:%u",
+        ADDRESS_STRING(serv_addr, addrbuf, sizeof(addrbuf)),
+        ntohs(ADDRESS_PORT(serv_addr)));
+
+    if (bind(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        handle_error("bind");
+    }
+
+    if (listen(sock, 10) < 0) {
+        handle_error("listen");
+    }
+
+    s->nfd = st_netfd_open_socket(sock);
+    s->start = start;
+    return st_thread_create(accept_loop, (void *)s, 0, 8 * 1024);
+}
+
+static int strtoaddr(const char *s, addr_t *a) {
+    if (!s) return 0;
+    int success = 0;
+
+    /* split port off address */
+    gchar *port_str = strrchr(s, ':');
+    if (!port_str) return 0;
+
+    *port_str = 0;
+    ++port_str;
+    a->port = htons((u_int16_t)strtol(port_str, NULL, 0));
+    if (a->port == 0) goto done;
+    if (inet_pton(AF_INET, s, &a->addr.in4) > 0) {
+        a->family = AF_INET;
+    } else if (inet_pton(AF_INET6, s, &a->addr.in6) > 0) {
+        a->family = AF_INET6;
+    } else {
+        goto done;
+    }
+
+    success=1;
+done:
+    --port_str;
+    *port_str = ':';
+    return success;
+}
+
 static gboolean close_connection(gpointer k, gpointer v, gpointer user_data) {
     (void)k;
     (void)user_data;
@@ -366,14 +446,16 @@ static void *tunnel_out_thread(void *arg) {
                     goto done;
                 }
                 client_t *c = g_hash_table_lookup(s->connections, &p->hdr.laddr);
-                if ((p->hdr.flags & TUN_FLAG_CLOSE) && c && c->nfd) {
-                    /* TODO maybe use st_thread_interrupt here? */
-                    g_message("got close flag packet. removing tunnel out client: %p (%d)",
-                        (void*)c->nfd, st_netfd_fileno(c->nfd));
-                    g_hash_table_remove(s->connections, &p->hdr.laddr);
-                } else if (c && c->nfd) {
-                    ssize_t nw = st_write(c->nfd, p->buf, p->hdr.size, ST_UTIME_NO_TIMEOUT);
-                    if (nw <= 0) { g_warning("write failed"); }
+                if (c && c->nfd) {
+                    if (p->hdr.flags & TUN_FLAG_CLOSE) {
+                        /* TODO maybe use st_thread_interrupt here? */
+                        g_message("got close flag packet. removing tunnel out client: %p (%d)",
+                            (void*)c->nfd, st_netfd_fileno(c->nfd));
+                        g_hash_table_remove(s->connections, &p->hdr.laddr);
+                    } else {
+                        ssize_t nw = st_write(c->nfd, p->buf, p->hdr.size, ST_UTIME_NO_TIMEOUT);
+                        if (nw <= 0) { g_warning("write failed"); }
+                    }
                 } else if (!(p->hdr.flags & TUN_FLAG_CLOSE)) {
                     g_message("tunnel out client not found, creating one");
                     address_t rmt_addr;
@@ -509,7 +591,6 @@ static void *tunnel_handler(void *arg) {
             do {
                 //g_debug("tunnel server read");
                 struct packet_s *p = g_slice_new(struct packet_s);
-                //ssize_t nr = packet_read(&zsi, client_nfd, p);
                 ssize_t nr = packet_bio_read(&zsi, bio, p);
                 if (nr < 0) { g_slice_free(struct packet_s, p); goto done; }
                 //g_debug("tunnel slave read %zd out of %d", nr, p->hdr.size);
@@ -534,7 +615,6 @@ static void *tunnel_handler(void *arg) {
                 //    ADDR_STRING(p->hdr.raddr, raddrbuf, sizeof(raddrbuf)), ntohs(p->hdr.raddr.port),
                 //    p->hdr.size);
 
-                //ssize_t nw = packet_write(&zso, client_nfd, p);
                 if (compression && packet_count >= 10) {
                     if ((compressed_packet_count / (float)packet_count) < 0.5) {
                         // turn off compression
@@ -607,7 +687,7 @@ done:
 
 /* PORT LISTENING SIDE */
 
-static void *handle_connection(void *arg) {
+static void *server_handle_connection(void *arg) {
     st_netfd_t client_nfd = (st_netfd_t)arg;
     address_t listening_addr;
     address_t local_addr;
@@ -652,12 +732,12 @@ static void *handle_connection(void *arg) {
         struct packet_s *p = g_slice_new0(struct packet_s);
         ssize_t nr = st_read(client_nfd, p->buf, sizeof(p->buf), ST_UTIME_NO_TIMEOUT);
         if (nr <= 0) { g_slice_free(struct packet_s, p); break; }
-        /* TODO: maybe don't do think  translation every time through the loop. could just be a memcpy */
         if (!g_hash_table_lookup(s->connections, (gpointer)hkey)) {
             /* connection missing from hash, probably got close packet from tunnel */
             g_slice_free(struct packet_s, p);
             break;
         }
+        /* TODO: maybe don't do think translation every time through the loop. could just be a memcpy */
         address_to_addr(&local_addr, &p->hdr.laddr);
         memcpy(&p->hdr.raddr, &s->remote_addr, sizeof(addr_t));
         p->hdr.size = nr;
@@ -678,7 +758,7 @@ static void *handle_connection(void *arg) {
     return NULL;
 }
 
-static void *tunnel_thread(void *arg) {
+static void *server_tunnel_thread(void *arg) {
     /* connect to remote side of tunnel */
     int status;
     server_t *s = (server_t *)arg;
@@ -699,7 +779,6 @@ restart:
 
     address_t rmt_addr;
     int sock;
-    //st_netfd_t rmt_nfd;
     BIO *bio_nfd = NULL;
 
     addr_to_address(&s->tunnel_addr, &rmt_addr);
@@ -784,7 +863,6 @@ restart:
                 //    ADDR_STRING(p->hdr.raddr, raddrbuf, sizeof(raddrbuf)), ntohs(p->hdr.raddr.port),
                 //    p->hdr.size);
 
-                //ssize_t nw = packet_write(&zso, rmt_nfd, p);
                 if (compression && packet_count >= 10) {
                     if ((compressed_packet_count / (float)packet_count) < 0.5) {
                         // turn off compression
@@ -832,60 +910,7 @@ done:
     return NULL;
 }
 
-static void *accept_loop(void *arg) {
-    struct server_s *s = (struct server_s *)arg;
-    st_netfd_t client_nfd;
-    struct sockaddr_in from;
-    int fromlen = sizeof(from);
-
-    for (;;) {
-        client_nfd = st_accept(s->nfd,
-          (struct sockaddr *)&from, &fromlen, ST_UTIME_NO_TIMEOUT);
-        g_message("accepted new connection");
-        if (st_thread_create(s->start,
-          (void *)client_nfd, 0, 1024 * 1024) == NULL)
-        {
-            g_critical("st_thread_create error");
-        }
-    }
-    g_warn_if_reached();
-    return NULL;
-}
-
-static st_thread_t listen_server(server_t *s, void *(*start)(void *arg)) {
-    int sock;
-    int n;
-
-    if ((sock = socket(PF_INET, SOCK_STREAM, 0)) < 0) {
-        handle_error("socket");
-    }
-
-    n = 1;
-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&n, sizeof(n)) < 0) {
-        handle_error("setsockopt SO_REUSEADDR");
-    }
-
-    address_t serv_addr;
-    addr_to_address(&s->listen_addr, &serv_addr);
-    char addrbuf[INET6_ADDRSTRLEN];
-    g_message("binding listening socket to: %s:%u",
-        ADDRESS_STRING(serv_addr, addrbuf, sizeof(addrbuf)),
-        ntohs(ADDRESS_PORT(serv_addr)));
-
-    if (bind(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        handle_error("bind");
-    }
-
-    if (listen(sock, 10) < 0) {
-        handle_error("listen");
-    }
-
-    s->nfd = st_netfd_open_socket(sock);
-    s->start = start;
-    return st_thread_create(accept_loop, (void *)s, 0, 8 * 1024);
-}
-
-static void *write_in_sthread(void *arg) {
+static void *server_write_sthread(void *arg) {
     /* write data coming across the tunnel to the client which initiated the connection */
     server_t *s = (server_t *)arg;
     struct pollfd pds[1];
@@ -919,9 +944,7 @@ static void *write_in_sthread(void *arg) {
                     g_message("found peer client, disconnecting");
                     g_hash_table_remove(s->connections, (gpointer)port);
                 } else if (c && c->nfd) {
-                    //g_debug("found peer client!");
                     ssize_t nw = st_write(c->nfd, p->buf, p->hdr.size, ST_UTIME_NO_TIMEOUT);
-                    //g_debug("%zd bytes written to client", nw);
                     if (nw <= 0) { g_warning("write failed"); }
                 } else {
                     g_message("peer client not found");
@@ -931,34 +954,8 @@ static void *write_in_sthread(void *arg) {
             //g_debug("read queue emptied");
         }
     }
-    g_debug("exiting write_in_sthread");
+    g_debug("exiting server_write_sthread");
     return NULL;
-}
-
-static int strtoaddr(const char *s, addr_t *a) {
-    if (!s) return 0;
-    int success = 0;
-
-    gchar *port_str = strrchr(s, ':');
-    if (!port_str) return 0;
-
-    *port_str = 0;
-    ++port_str;
-    a->port = htons((u_int16_t)strtol(port_str, NULL, 0));
-    if (a->port == 0) goto done;
-    if (inet_pton(AF_INET, s, &a->addr.in4) > 0) {
-        a->family = AF_INET;
-    } else if (inet_pton(AF_INET6, s, &a->addr.in6) > 0) {
-        a->family = AF_INET6;
-    } else {
-        goto done;
-    }
-
-    success=1;
-done:
-    --port_str;
-    *port_str = ':';
-    return success;
 }
 
 static void parse_config(const gchar *conffile) {
@@ -1071,15 +1068,6 @@ int main(int argc, char *argv[]) {
     /* init state threads */
     if (st_init() < 0) { handle_error("state threads"); }
 
-#if 0
-    g_debug("sizeof(addr_t) = %zu", sizeof(addr_t));
-    g_debug("sizeof(struct sockaddr) = %zu", sizeof(struct sockaddr));
-    g_debug("sizeof(struct sockaddr_in) = %zu", sizeof(struct sockaddr_in));
-    g_debug("sizeof(struct sockaddr_in6) = %zu", sizeof(struct sockaddr_in6));
-    g_debug("sizeof(struct sockaddr_storage) = %zu", sizeof(struct sockaddr_storage));
-    g_debug("sizeof(address_t) = %zu", sizeof(address_t));
-#endif
-
     netmap = g_hash_table_new(g_int_hash, addr_match);
     tunmap = g_hash_table_new(g_int_hash, addr_match);
 
@@ -1116,9 +1104,9 @@ int main(int argc, char *argv[]) {
         s->read_queue = g_async_queue_new_full(packet_free);
         s->write_queue = g_async_queue_new_full(packet_free);
         s->connections = g_hash_table_new(g_direct_hash, g_direct_equal);
-        s->listen_sthread = listen_server(s, handle_connection);
-        s->write_sthread = st_thread_create(write_in_sthread, s, 0, 8*1024);
-        s->thread = g_thread_create(tunnel_thread, s, TRUE, NULL);
+        s->listen_sthread = listen_server(s, server_handle_connection);
+        s->write_sthread = st_thread_create(server_write_sthread, s, 0, 8*1024);
+        s->thread = g_thread_create(server_tunnel_thread, s, TRUE, NULL);
     }
 
     st_netfd_t sig_nfd = st_netfd_open(sfd);
