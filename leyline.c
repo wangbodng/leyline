@@ -171,7 +171,12 @@ static server_t *tunnel_server;
 static const gchar *tunnel_cert_path;
 static const gchar *tunnel_pkey_path;
 
-void queue_push_notify(int fd, GAsyncQueue *q, gpointer data) {
+/* additions to g_async_queue to allow waiting on a socket (via st_poll)
+ * for the queue to be non-empty. a single byte is sent whenever the
+ * queue moves from empty to non-empty state. the polling thread can then
+ * read a single byte and pop off the queue until it is emptied.
+ */
+static void queue_push_notify(int fd, GAsyncQueue *q, gpointer data) {
     g_async_queue_lock(q);
     int len = g_async_queue_length_unlocked(q);
     g_async_queue_push_unlocked(q, data);
@@ -185,6 +190,21 @@ void queue_push_notify(int fd, GAsyncQueue *q, gpointer data) {
         /* g_debug("queue backlog: %u sleeping to throttle.", len); */
         st_usleep(len * 10);
     }
+}
+
+static void queue_clear_notify(int fd) {
+    char tmp[1];
+    int n = read(fd, tmp, 1);
+    g_assert(n == 1);
+}
+
+static void queue_remove_all_packets(GAsyncQueue *q) {
+    g_async_queue_lock(q);
+    struct packet_s *p;
+    while ((p = g_async_queue_try_pop_unlocked(q))) {
+        g_slice_free(struct packet_s, p);
+    }
+    g_async_queue_unlock(q);
 }
 
 static ssize_t packet_bio_write(z_streamp strm, BIO *bio, struct packet_s *p, int try_compress) {
@@ -425,9 +445,7 @@ static void *tunnel_out_thread(void *arg) {
         if (st_poll(pds, 1, ST_UTIME_NO_TIMEOUT) <= 0) break;
 
         if (pds[0].revents & POLLIN) {
-            char tmp[1];
-            int n = read(s->read_fd, tmp, 1);
-            g_assert(n == 1);
+            queue_clear_notify(s->read_fd);
             struct packet_s *p;
             while ((p = g_async_queue_try_pop(s->write_queue))) {
                 if (p->hdr.flags & TUN_FLAG_CLOSE_ALL) {
@@ -590,8 +608,7 @@ static void *tunnel_handler(void *arg) {
         }
 
         if (pds[1].revents & POLLIN) {
-            char tmp[1];
-            read(s->write_fd, tmp, 1);
+            queue_clear_notify(s->write_fd);
             struct packet_s *p;
             while ((p = g_async_queue_try_pop(s->read_queue))) {
                 if (compression && packet_count >= 10) {
@@ -632,24 +649,12 @@ done:
         p->hdr.flags |= TUN_FLAG_CLOSE_ALL;
         queue_push_notify(s->write_fd, s->write_queue, p);
         /* empty the read queue */
-        do {
-            struct packet_s *p;
-            while ((p = g_async_queue_try_pop(s->read_queue))) {
-                g_slice_free(struct packet_s, p);
-            }
-        } while (0);
-
+        queue_remove_all_packets(s->read_queue);
         g_debug("tunnel_out_thread joining...");
         g_thread_join(s->thread);
         g_debug("tunnel_out_thread done");
-
         /* empty the write queue */
-        do {
-            struct packet_s *p;
-            while ((p = g_async_queue_try_pop(s->write_queue))) {
-                g_slice_free(struct packet_s, p);
-            }
-        } while (0);
+        queue_remove_all_packets(s->write_queue);
         g_async_queue_unref(s->read_queue);
         g_async_queue_unref(s->write_queue);
         close(s->read_fd);
@@ -774,15 +779,25 @@ restart:
     bio = bio_nfd;
     BIO_get_fp(bio_nfd, &rmt_nfd);
 
-    for (;;) {
-        if (st_connect(rmt_nfd, (struct sockaddr *)&rmt_addr,
-              sizeof(rmt_addr), ST_UTIME_NO_TIMEOUT) == 0) {
-            break;
+    do {
+        int tries = 0;
+        int min_sleep = 1;
+        int max_sleep = 5;
+        for (;;) {
+            if (st_connect(rmt_nfd, (struct sockaddr *)&rmt_addr,
+                  sizeof(rmt_addr), ST_UTIME_NO_TIMEOUT) == 0) {
+                break;
+            }
+            ++tries;
+            int sleep_sec = (random() % max_sleep) + min_sleep;
+            g_message("sleeping %u sec before retry connecting tunnel", sleep_sec);
+            st_sleep(sleep_sec);
+            if (tries >= 5) {
+                if (max_sleep < 10) ++max_sleep;
+                if (min_sleep < 5) ++min_sleep;
+            }
         }
-        int sleep_sec = (random() % 5) + 1;
-        g_message("sleeping %u sec before retry connecting tunnel", sleep_sec);
-        st_sleep(sleep_sec);
-    }
+    } while (0);
     g_message("connected to tunnel!");
 
     if (s->tunnel_secure) {
@@ -828,9 +843,7 @@ restart:
         }
 
         if (pds[1].revents & POLLIN) {
-            char tmp[1];
-            int n = read(s->read_fd, tmp, 1);
-            g_assert(n == 1);
+            queue_clear_notify(s->read_fd);
             struct packet_s *p;
             while ((p = g_async_queue_try_pop(s->write_queue))) {
                 if (compression && packet_count >= 10) {
@@ -866,13 +879,7 @@ done:
     p->hdr.flags |= TUN_FLAG_CLOSE_ALL;
     queue_push_notify(s->read_fd, s->read_queue, p);
     /* empty the write queue */
-    do {
-        struct packet_s *p;
-        while ((p = g_async_queue_try_pop(s->write_queue))) {
-            g_slice_free(struct packet_s, p);
-        }
-    } while (0);
-
+    queue_remove_all_packets(s->write_queue);
     /* try to reconnect to tunnel again */
     goto restart;
     st_thread_exit(NULL);
@@ -891,8 +898,7 @@ static void *server_write_sthread(void *arg) {
         if (st_poll(pds, 1, ST_UTIME_NO_TIMEOUT) <= 0) break;
 
         if (pds[0].revents & POLLIN) {
-            char tmp[1];
-            read(s->write_fd, tmp, 1);
+            queue_clear_notify(s->write_fd);
             struct packet_s *p;
             while ((p = g_async_queue_try_pop(s->read_queue))) {
                 if (p->hdr.flags & TUN_FLAG_CLOSE_ALL) {
@@ -1006,6 +1012,7 @@ int main(int argc, char *argv[]) {
     struct signalfd_siginfo fdsi;
     struct timeval tv;
 
+    /* seed random */
     gettimeofday(&tv, NULL);
     srandom(tv.tv_usec);
 
