@@ -140,7 +140,7 @@ struct server_s {
 };
 typedef struct server_s server_t;
 
-void server_init(server_t *s, GHashTable *ctable) {
+static void server_init(server_t *s, GHashTable *ctable) {
     int sockets[2];
     int status;
 
