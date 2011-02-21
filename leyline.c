@@ -14,6 +14,10 @@
 #include <sys/signalfd.h>
 #include <signal.h>
 #include <sys/time.h>
+#include <sys/types.h>
+#include <sys/syscall.h>
+
+#define STACK_SIZE (32*1024)
 
 #define handle_error(msg) \
     do { perror(msg); exit(EXIT_FAILURE); } while (0)
@@ -192,8 +196,13 @@ static void queue_push_notify(int fd, GAsyncQueue *q, gpointer data) {
 
 static void queue_clear_notify(int fd) {
     char tmp[1];
-    int n = read(fd, tmp, 1);
-    g_assert(n == 1);
+    for (;;) {
+        ssize_t nr = read(fd, tmp, 1);
+        /* in the rare case that read is interrupted by a signal, try again */
+        if (nr == -1 && errno == EINTR) { continue; }
+        if (nr != 1) { g_critical("read failed on queue fd\n"); }
+        return;
+    }
 }
 
 static void queue_remove_all_packets(GAsyncQueue *q) {
@@ -206,7 +215,7 @@ static void queue_remove_all_packets(GAsyncQueue *q) {
 }
 
 static ssize_t packet_bio_write(z_streamp strm, BIO *bio, struct packet_s *p, int try_compress) {
-    char *buf = alloca(deflateBound(strm, PACKET_DATA_SIZE));
+    char buf[PACKET_DATA_SIZE + 1024];
     ssize_t nw = 0;
     if (p->hdr.size && try_compress) {
         strm->next_in = (Bytef *)p->buf;
@@ -287,7 +296,7 @@ static void *accept_loop(void *arg) {
           (struct sockaddr *)&from, &fromlen, ST_UTIME_NO_TIMEOUT);
         g_message("accepted new connection");
         if (st_thread_create(s->start,
-          (void *)client_nfd, 0, 1024 * 1024) == NULL)
+          (void *)client_nfd, 0, STACK_SIZE) == NULL)
         {
             g_critical("st_thread_create error");
         }
@@ -326,7 +335,7 @@ static st_thread_t listen_server(server_t *s, void *(*start)(void *arg)) {
 
     s->nfd = st_netfd_open_socket(sock);
     s->start = start;
-    return st_thread_create(accept_loop, (void *)s, 0, 8 * 1024);
+    return st_thread_create(accept_loop, (void *)s, 0, STACK_SIZE);
 }
 
 static int strtoaddr(const char *s, addr_t *a) {
@@ -491,7 +500,7 @@ static void *tunnel_out_thread(void *arg) {
 
                         /* the packet that initiates an outgoing connection should have 0 bytes */
                         g_assert(p->hdr.size == 0);
-                        c->sthread = st_thread_create(tunnel_out_read_sthread, c, 0, 8*1024);
+                        c->sthread = st_thread_create(tunnel_out_read_sthread, c, 0, STACK_SIZE);
                         g_assert(c->sthread);
                     } else {
                         g_message("connection to remote host failed. notify client through tunnel.");
@@ -995,6 +1004,46 @@ free_key_file:
     g_key_file_free(kf);
 }
 
+static char level_char(GLogLevelFlags level) {
+    switch (level) {
+        case G_LOG_LEVEL_ERROR:
+            return 'E';
+        case G_LOG_LEVEL_CRITICAL:
+            return 'C';
+        case G_LOG_LEVEL_WARNING:
+            return 'W';
+        case G_LOG_LEVEL_MESSAGE:
+            return 'M';
+        case G_LOG_LEVEL_INFO:
+            return 'I';
+        case G_LOG_LEVEL_DEBUG:
+            return 'D';
+        default:
+            return 'U';
+    }
+    return '?';
+}
+
+static void log_func(const gchar *log_domain,
+    GLogLevelFlags log_level,
+    const gchar *message,
+    gpointer user_data)
+{
+    struct tm t;
+    time_t ti = st_time();
+    struct timeval tv;
+    uint64_t usec;
+    gettimeofday(&tv, NULL);
+    usec = (uint64_t)(tv.tv_sec * 1000000) + tv.tv_usec;
+    localtime_r(&ti, &t);
+    fprintf(stderr, "%c%02d%02d %02u:%02u:%02u.%06u %5u|%5u] %s\n",
+        level_char(log_level),
+        1 + t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec,
+        (int)st_utime(),
+        (uint32_t)syscall(SYS_gettid),
+        (uint32_t)st_thread_self() % 100000,
+        message);
+}
 
 static const gchar *conffile = "leyline.conf";
 
@@ -1026,6 +1075,8 @@ int main(int argc, char *argv[]) {
 
     /* init glib threads */
     g_thread_init(NULL);
+
+    g_log_set_default_handler(log_func, NULL);
 
     /* init Open SSL */
     SSL_load_error_strings();
@@ -1063,7 +1114,7 @@ int main(int argc, char *argv[]) {
     while (g_hash_table_iter_next(&iter, (gpointer *)&listen_addr, (gpointer *)&s)) {
         server_init(s, g_hash_table_new(g_direct_hash, g_direct_equal));
         s->listen_sthread = listen_server(s, server_handle_connection);
-        s->write_sthread = st_thread_create(server_write_sthread, s, 0, 8*1024);
+        s->write_sthread = st_thread_create(server_write_sthread, s, 0, STACK_SIZE);
         s->thread = g_thread_create(server_tunnel_thread, s, TRUE, NULL);
     }
 
