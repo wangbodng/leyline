@@ -16,6 +16,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/syscall.h>
+#include <inttypes.h>
 
 #define STRINGIFY(x) #x
 #define TOSTRING(x) STRINGIFY(x)
@@ -627,7 +628,7 @@ static void *tunnel_handler(void *arg) {
                 if (compression && packet_count >= 10) {
                     if ((compressed_packet_count / (float)packet_count) < 0.5) {
                         // turn off compression
-                        g_debug("turning off compression: %llu/%llu %f",
+                        g_debug("turning off compression: %ju/%ju %f",
                             compressed_packet_count,
                             packet_count,
                             (compressed_packet_count / (float)packet_count));
@@ -861,7 +862,7 @@ restart:
                 if (compression && packet_count >= 10) {
                     if ((compressed_packet_count / (float)packet_count) < 0.5) {
                         // turn off compression
-                        g_debug("turning off compression: %llu/%llu %f",
+                        g_debug("turning off compression: %ju/%ju %f",
                             compressed_packet_count,
                             packet_count,
                             (compressed_packet_count / (float)packet_count));
@@ -1053,7 +1054,7 @@ static void log_func(const gchar *log_domain,
         1 + t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec,
         (int)st_utime(),
         (uint32_t)syscall(SYS_gettid),
-        (uint32_t)st_thread_self() % 100000,
+        (uint32_t)((intptr_t)st_thread_self() % 100000),
         domain,
         message);
 }
