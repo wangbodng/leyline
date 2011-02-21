@@ -17,6 +17,12 @@
 #include <sys/types.h>
 #include <sys/syscall.h>
 
+#define STRINGIFY(x) #x
+#define TOSTRING(x) STRINGIFY(x)
+#define CODE_AT (__FILE__ ":" TOSTRING(__LINE__))
+#undef G_LOG_DOMAIN
+#define G_LOG_DOMAIN CODE_AT
+
 #define STACK_SIZE (32*1024)
 
 #define handle_error(msg) \
@@ -1029,19 +1035,26 @@ static void log_func(const gchar *log_domain,
     const gchar *message,
     gpointer user_data)
 {
+    (void)user_data;
     struct tm t;
     time_t ti = st_time();
     struct timeval tv;
     uint64_t usec;
+    const char *domain = "";
     gettimeofday(&tv, NULL);
     usec = (uint64_t)(tv.tv_sec * 1000000) + tv.tv_usec;
     localtime_r(&ti, &t);
-    fprintf(stderr, "%c%02d%02d %02u:%02u:%02u.%06u %5u|%5u] %s\n",
+    if (log_domain) {
+        domain = strrchr(log_domain, '/');
+        if (domain) ++domain;
+    }
+    fprintf(stderr, "%c%02d%02d %02u:%02u:%02u.%06u %5u:%05u %s] %s\n",
         level_char(log_level),
         1 + t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec,
         (int)st_utime(),
         (uint32_t)syscall(SYS_gettid),
         (uint32_t)st_thread_self() % 100000,
+        domain,
         message);
 }
 
